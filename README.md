@@ -1,6 +1,6 @@
 # memory-pool-allocator
 
-A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chunk sizes and efficient allocation/deallocation.
+A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chunk sizes and efficient allocation/deallocation. Made mostly using a mix of generative AI tools, such as Claude and Copilot.
 
 ## Features
 - No_std compatible
