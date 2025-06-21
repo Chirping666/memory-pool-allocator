@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 parking_lot = { version = "0.12", default-features = false }
+
+[features]
+default = ["pointer-tracking"]
+pointer-tracking = []
+
+[dev-dependencies]
+heapless = "0.8"
