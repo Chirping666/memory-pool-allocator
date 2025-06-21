@@ -32,13 +32,14 @@ use parking_lot::Mutex;
 /// ```
 pub struct MemoryPoolAllocator<const N: usize, const M: usize>
 where
-    [u8; N]: Sized,        // Ensure N is a valid size for an array
-    [BlockInfo; M]: Sized, // Ensure M is a valid size for an array
+    [u8; N]: Sized,
+    [BlockInfo; M]: Sized,
 {
     /// Inner mutex to protect the memory pool state
     /// This allows safe concurrent access to the pool
     /// across multiple threads.
     inner: Mutex<PoolInner<N, M>>,
+    stats: Mutex<PoolStats>,
 }
 
 struct PoolInner<const N: usize, const M: usize> {
@@ -86,8 +87,8 @@ unsafe impl<const N: usize, const M: usize> Send for MemoryPoolAllocator<N, M> {
 
 impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M>
 where
-    [u8; N]: Sized,        // Ensure N is a valid size for an array
-    [BlockInfo; M]: Sized, // Ensure M is a valid size for an array
+    [u8; N]: Sized,
+    [BlockInfo; M]: Sized,
 {
     /// The size of each chunk in bytes
     const CHUNK_SIZE: usize = N / M;
@@ -106,6 +107,7 @@ where
         blocks[0] = BlockInfo::FreeStart(M);
         MemoryPoolAllocator {
             inner: Mutex::new(PoolInner { pool, blocks }),
+            stats: Mutex::new(PoolStats::new(N, N / M, M)),
         }
     }
 
@@ -154,7 +156,9 @@ where
             return Ok(NonNull::dangling().as_ptr());
         }
         if !alignment.is_power_of_two() || alignment > N {
-            return Err(AllocError::OutOfBounds);
+            let mut stats = self.stats.lock();
+            stats.inc_alloc_errors();
+            return Err(AllocError::Other);
         }
         let chunks_needed = Self::size_to_chunks(size);
         let mut inner = self.inner.lock();
@@ -168,20 +172,30 @@ where
                 let alignment_offset_bytes = aligned_addr - block_addr;
                 let alignment_offset_chunks = Self::size_to_chunks(alignment_offset_bytes);
                 if alignment_offset_chunks + chunks_needed <= block_chunks {
-                    return Ok(self.allocate_in_block(
+                    let ptr = self.allocate_in_block(
                         &mut inner,
                         chunk_idx,
                         block_chunks,
                         alignment_offset_chunks,
                         chunks_needed,
                         aligned_addr,
-                    ));
+                    );
+                    // Update stats
+                    let mut stats = self.stats.lock();
+                    stats.allocated_blocks += 1;
+                    let alloc_bytes = chunks_needed * Self::CHUNK_SIZE;
+                    stats.allocated_bytes += alloc_bytes;
+                    stats.free_bytes = stats.free_bytes.saturating_sub(alloc_bytes);
+                    stats.free_blocks = stats.free_blocks.saturating_sub(1);
+                    return Ok(ptr);
                 }
                 chunk_idx += block_chunks;
             } else {
                 chunk_idx += 1;
             }
         }
+        let mut stats = self.stats.lock();
+        stats.inc_alloc_errors();
         Err(AllocError::Other)
     }
 
@@ -216,24 +230,32 @@ where
     #[cfg(feature = "pointer-tracking")]
     pub fn try_deallocate(&self, ptr: *mut u8, layout: Layout) -> Result<(), AllocError> {
         if ptr.is_null() || layout.size() == 0 {
-            return Ok(());
+            let mut stats = self.stats.lock();
+            stats.inc_invalid_dealloc();
+            return Err(AllocError::InvalidDeallocation);
         }
         let mut inner = self.inner.lock();
         let pool_addr = inner.pool.as_mut_ptr() as usize;
         let ptr_addr = ptr as usize;
         if ptr_addr < pool_addr || ptr_addr >= pool_addr + N {
+            let mut stats = self.stats.lock();
+            stats.inc_invalid_dealloc();
             return Err(AllocError::OutOfBounds);
         }
         let byte_offset = ptr_addr - pool_addr;
         let chunk_idx = Self::byte_to_chunk(byte_offset);
         if chunk_idx >= inner.blocks.len() {
+            let mut stats = self.stats.lock();
+            stats.inc_invalid_dealloc();
             return Err(AllocError::OutOfBounds);
         }
         match inner.blocks[chunk_idx] {
             BlockInfo::AllocatedStart(chunk_count) => {
                 let allocated_bytes = chunk_count * Self::CHUNK_SIZE;
                 if layout.size() > allocated_bytes {
-                    return Err(AllocError::Other);
+                    let mut stats = self.stats.lock();
+                    stats.inc_invalid_dealloc();
+                    return Err(AllocError::InvalidDeallocation);
                 }
                 let actual_byte_start = Self::chunk_to_byte(chunk_idx);
                 let clear_size = core::cmp::min(allocated_bytes, N - actual_byte_start);
@@ -249,9 +271,19 @@ where
                     BlockInfo::FreeStart(chunk_count),
                 );
                 self.coalesce_free_blocks(&mut inner.blocks, chunk_idx);
+                // Update stats
+                let mut stats = self.stats.lock();
+                stats.allocated_blocks = stats.allocated_blocks.saturating_sub(1);
+                stats.allocated_bytes = stats.allocated_bytes.saturating_sub(allocated_bytes);
+                stats.free_bytes += allocated_bytes;
+                stats.free_blocks += 1;
                 Ok(())
             }
-            _ => Err(AllocError::NotAllocated),
+            _ => {
+                let mut stats = self.stats.lock();
+                stats.inc_invalid_dealloc();
+                Err(AllocError::InvalidDeallocation)
+            }
         }
     }
 
@@ -441,48 +473,8 @@ where
     ///
     /// # Returns
     /// * `PoolStats` - Structure containing various statistics
-    pub fn get_stats(&self) -> PoolStats {
-        let inner = self.inner.lock();
-        let mut stats = PoolStats::default();
-        let mut chunk_idx = 0;
-
-        while chunk_idx < inner.blocks.len() {
-            match inner.blocks[chunk_idx] {
-                BlockInfo::FreeStart(chunk_count) => {
-                    let byte_count = core::cmp::min(
-                        chunk_count * Self::CHUNK_SIZE,
-                        N - Self::chunk_to_byte(chunk_idx),
-                    );
-                    stats.free_bytes += byte_count;
-                    stats.free_blocks += 1;
-                    if byte_count > stats.largest_free_block {
-                        stats.largest_free_block = byte_count;
-                    }
-                    chunk_idx += chunk_count;
-                }
-                BlockInfo::AllocatedStart(chunk_count) => {
-                    let byte_count = core::cmp::min(
-                        chunk_count * Self::CHUNK_SIZE,
-                        N - Self::chunk_to_byte(chunk_idx),
-                    );
-                    stats.allocated_bytes += byte_count;
-                    stats.allocated_blocks += 1;
-                    chunk_idx += chunk_count;
-                }
-                _ => chunk_idx += 1,
-            }
-        }
-
-        stats.total_size = N;
-        stats.chunk_size = Self::CHUNK_SIZE;
-        stats.total_chunks = M;
-        stats.fragmentation = if stats.free_bytes > 0 && stats.free_blocks > 0 {
-            ((stats.free_bytes - stats.largest_free_block) * 10000) / stats.free_bytes
-        } else {
-            0
-        };
-
-        stats
+    pub fn get_stats(&self) -> parking_lot::MutexGuard<'_, PoolStats> {
+        self.stats.lock()
     }
 
     #[inline]
@@ -517,6 +509,30 @@ pub struct PoolStats {
     pub invalid_deallocations: usize,
     #[cfg(feature = "pointer-tracking")]
     pub allocation_errors: usize,
+}
+
+impl PoolStats {
+    pub const fn new(total_size: usize, chunk_size: usize, total_chunks: usize) -> Self {
+        Self {
+            total_size,
+            chunk_size,
+            total_chunks,
+            allocated_bytes: 0,
+            free_bytes: 0,
+            allocated_blocks: 0,
+            free_blocks: 0,
+            largest_free_block: 0,
+            fragmentation: 0,
+            invalid_deallocations: 0,
+            allocation_errors: 0,
+        }
+    }
+    pub fn inc_invalid_dealloc(&mut self) {
+        self.invalid_deallocations += 1;
+    }
+    pub fn inc_alloc_errors(&mut self) {
+        self.allocation_errors += 1;
+    }
 }
 
 #[inline]
