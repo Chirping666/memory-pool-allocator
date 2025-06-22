@@ -7,5 +7,5 @@ edition = "2024"
 parking_lot = { version = "0.12", default-features = false }
 
 [features]
-default = ["pointer-tracking"]
-pointer-tracking = []
+default = ["zero-on-free"]
+zero-on-free = []

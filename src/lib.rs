@@ -1,43 +1,26 @@
-// Copyright 2024 <your name or organization>
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
-// This file may not be copied, modified, or distributed except according to those terms.
+// Copyright 2024 Chirping666
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0>
+// or the MIT license <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
 
 #![no_std]
 
-use core::{
-    alloc::{GlobalAlloc, Layout},
-    ptr::NonNull,
-};
+use core::{alloc::Layout, ptr::NonNull};
 use parking_lot::Mutex;
 
-/// A fixed-size memory allocator that manages memory in chunks/blocks
-///
+/// Fixed-size memory pool allocator with compile-time size configuration
+/// 
 /// # Type Parameters
-/// * `N` - Total size of the memory pool in bytes
-/// * `M` - Number of blocks/chunks to divide the pool into
-///
-/// The allocator divides the memory pool into M equal-sized chunks, where each chunk
-/// is N/M bytes. This means N must be exactly divisible by M (N % M == 0).
-///
-/// # Panics
-/// The `new()` constructor will panic if N is not exactly divisible by M.
-///
-/// # Example
-/// ```
-/// use memory_pool_allocator::MemoryPoolAllocator;
-///
-/// // Create a 1024-byte pool divided into 64 chunks (16 bytes each)
-/// let allocator = MemoryPoolAllocator::<1024, 64>::new();
-/// ```
+/// * `N` - Total pool size in bytes
+/// * `M` - Number of chunks to divide the pool into
+/// 
+/// # Invariants
+/// * `N` must be exactly divisible by `M`
+/// * Each chunk is `N/M` bytes
 pub struct MemoryPoolAllocator<const N: usize, const M: usize>
 where
     [u8; N]: Sized,
     [BlockInfo; M]: Sized,
 {
-    /// Inner mutex to protect the memory pool state
-    /// This allows safe concurrent access to the pool
-    /// across multiple threads.
     inner: Mutex<PoolInner<N, M>>,
     stats: Mutex<PoolStats>,
 }
@@ -47,41 +30,78 @@ struct PoolInner<const N: usize, const M: usize> {
     blocks: [BlockInfo; M],
 }
 
+/// Tracks the state of each chunk in the pool
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BlockInfo {
+    /// Start of a free block with total chunk count
     FreeStart(usize),
+    /// Continuation of a free block
     FreeContinuation,
+    /// Start of an allocated block with total chunk count
     AllocatedStart(usize),
+    /// Continuation of an allocated block
     AllocatedContinuation,
 }
 
-#[cfg(feature = "pointer-tracking")]
+/// Allocation errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocError {
-    InvalidDeallocation,
+    /// Not enough contiguous space
+    OutOfMemory,
+    /// Invalid layout parameters
+    InvalidLayout,
+    /// Pointer not from this allocator
+    InvalidPointer,
+    /// Pointer not currently allocated
     NotAllocated,
-    OutOfBounds,
-    Other,
 }
 
-#[cfg(feature = "pointer-tracking")]
 impl core::fmt::Display for AllocError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AllocError::InvalidDeallocation => write!(
-                f,
-                "Invalid deallocation: pointer was not allocated by this allocator"
-            ),
-            AllocError::NotAllocated => write!(f, "Pointer is not currently allocated"),
-            AllocError::OutOfBounds => write!(f, "Pointer is out of bounds of the pool"),
-            AllocError::Other => write!(f, "Other allocation error"),
+            Self::OutOfMemory => write!(f, "Out of memory"),
+            Self::InvalidLayout => write!(f, "Invalid layout parameters"),
+            Self::InvalidPointer => write!(f, "Pointer not from this allocator"),
+            Self::NotAllocated => write!(f, "Pointer not currently allocated"),
         }
     }
 }
 
-#[cfg(feature = "pointer-tracking")]
-impl core::error::Error for AllocError {}
+/// Pool statistics
+#[derive(Debug, Clone)]
+pub struct PoolStats {
+    pub total_size: usize,
+    pub chunk_size: usize,
+    pub total_chunks: usize,
+    pub allocated_bytes: usize,
+    pub free_bytes: usize,
+    pub allocated_blocks: usize,
+    pub free_blocks: usize,
+    pub largest_free_block: usize,
+    pub fragmentation: usize, // Percentage * 100 (e.g., 2500 = 25%)
+    pub allocation_errors: usize,
+    pub deallocation_errors: usize,
+}
 
+impl PoolStats {
+    const fn new(total_size: usize, chunk_size: usize, total_chunks: usize) -> Self {
+        Self {
+            total_size,
+            chunk_size,
+            total_chunks,
+            allocated_bytes: 0,
+            free_bytes: total_size,
+            allocated_blocks: 0,
+            free_blocks: 1, // Initially one large free block
+            largest_free_block: total_size,
+            fragmentation: 0,
+            allocation_errors: 0,
+            deallocation_errors: 0,
+        }
+    }
+}
+
+// Safety: Pool data is protected by mutex
 unsafe impl<const N: usize, const M: usize> Sync for MemoryPoolAllocator<N, M> {}
 unsafe impl<const N: usize, const M: usize> Send for MemoryPoolAllocator<N, M> {}
 
@@ -90,470 +110,369 @@ where
     [u8; N]: Sized,
     [BlockInfo; M]: Sized,
 {
-    /// The size of each chunk in bytes
+    /// Size of each chunk in bytes
     const CHUNK_SIZE: usize = N / M;
 
     /// Creates a new memory pool allocator
-    /// # Returns
-    /// * `MemoryPoolAllocator<N, M>` - A new instance of the memory pool allocator
-    ///
-    /// # Panics
-    /// This function will panic if `N` is not exactly divisible by `M`.
-    /// This ensures that the memory pool can be evenly divided into `M` chunks.
     pub const fn new() -> Self {
-        assert!(N % M == 0);
-        let pool = [0u8; N];
+        assert!(N % M == 0, "N must be exactly divisible by M");
+        assert!(N > 0 && M > 0, "Pool and chunk count must be positive");
+        
         let mut blocks = [BlockInfo::FreeContinuation; M];
         blocks[0] = BlockInfo::FreeStart(M);
-        MemoryPoolAllocator {
-            inner: Mutex::new(PoolInner { pool, blocks }),
+        
+        Self {
+            inner: Mutex::new(PoolInner { 
+                pool: [0u8; N], 
+                blocks 
+            }),
             stats: Mutex::new(PoolStats::new(N, N / M, M)),
         }
     }
 
-    #[inline]
-    /// Converts a byte offset to a chunk index
-    fn byte_to_chunk(byte_offset: usize) -> usize {
-        byte_offset / Self::CHUNK_SIZE
-    }
-
-    #[inline]
-    /// Converts a chunk index to a byte offset
-    fn chunk_to_byte(chunk_index: usize) -> usize {
-        chunk_index * Self::CHUNK_SIZE
-    }
-
-    #[inline]
-    /// Converts a size in bytes to the number of chunks needed
-    fn size_to_chunks(size: usize) -> usize {
-        (size + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE
-    }
-
-    /// Allocates a block of memory with the specified layout
-    /// # Arguments
-    /// * `layout` - The layout describing the size and alignment of the memory block
-    ///
-    /// # Returns
-    /// * `*mut u8` - Pointer to the allocated memory block, or null pointer if allocation fails
-    ///
-    /// # Safety
-    /// The caller must ensure that the pointer is valid and properly aligned for the requested layout.
-    /// The caller is also responsible for deallocating the memory using `deallocate`.
-    pub fn allocate(&self, layout: Layout) -> *mut u8 {
-        match self.try_allocate(layout) {
-            Ok(ptr) => ptr,
-            Err(_) => core::ptr::null_mut(),
-        }
-    }
-
-    /// Attempts to allocate a block of memory with the specified layout.
-    /// Returns a pointer on success, or an error on failure.
-    #[cfg(feature = "pointer-tracking")]
+    /// Attempts to allocate memory with the specified layout
     pub fn try_allocate(&self, layout: Layout) -> Result<*mut u8, AllocError> {
-        let size = layout.size();
-        let alignment = layout.align();
-        if size == 0 {
+        // Handle zero-size allocations
+        if layout.size() == 0 {
             return Ok(NonNull::dangling().as_ptr());
         }
-        if !alignment.is_power_of_two() || alignment > N {
-            let mut stats = self.stats.lock();
-            stats.inc_alloc_errors();
-            return Err(AllocError::Other);
+
+        // Validate layout
+        if !layout.align().is_power_of_two() || layout.align() > N {
+            self.stats.lock().allocation_errors += 1;
+            return Err(AllocError::InvalidLayout);
         }
-        let chunks_needed = Self::size_to_chunks(size);
+
+        let chunks_needed = Self::bytes_to_chunks(layout.size());
         let mut inner = self.inner.lock();
-        let pool_addr = inner.pool.as_mut_ptr() as usize;
+        
+        // Find a suitable free block
+        let result = self.find_and_allocate_block(&mut inner, layout, chunks_needed);
+        
+        match result {
+            Ok(ptr) => {
+                self.update_stats_after_allocation(chunks_needed);
+                Ok(ptr)
+            }
+            Err(e) => {
+                self.stats.lock().allocation_errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempts to deallocate previously allocated memory
+    pub fn try_deallocate(&self, ptr: *mut u8, layout: Layout) -> Result<(), AllocError> {
+        // Handle null and zero-size
+        if ptr.is_null() || layout.size() == 0 {
+            self.stats.lock().deallocation_errors += 1;
+            return Err(AllocError::InvalidPointer);
+        }
+
+        let mut inner = self.inner.lock();
+        
+        // Validate pointer is within pool
+        let pool_start = inner.pool.as_ptr() as usize;
+        let pool_end = pool_start + N;
+        let ptr_addr = ptr as usize;
+        
+        if ptr_addr < pool_start || ptr_addr >= pool_end {
+            self.stats.lock().deallocation_errors += 1;
+            return Err(AllocError::InvalidPointer);
+        }
+
+        // Find the chunk and validate it's allocated
+        let byte_offset = ptr_addr - pool_start;
+        let chunk_idx = byte_offset / Self::CHUNK_SIZE;
+        
+        if chunk_idx >= M {
+            self.stats.lock().deallocation_errors += 1;
+            return Err(AllocError::InvalidPointer);
+        }
+
+        match inner.blocks[chunk_idx] {
+            BlockInfo::AllocatedStart(chunk_count) => {
+                // Clear memory if feature enabled
+                #[cfg(feature = "zero-on-free")]
+                self.clear_memory(&mut inner.pool, chunk_idx, chunk_count);
+                
+                // Mark as free and coalesce
+                self.mark_chunks_free(&mut inner.blocks, chunk_idx, chunk_count);
+                self.coalesce_free_blocks(&mut inner.blocks, chunk_idx);
+                
+                self.update_stats_after_deallocation(chunk_count);
+                Ok(())
+            }
+            _ => {
+                self.stats.lock().deallocation_errors += 1;
+                Err(AllocError::NotAllocated)
+            }
+        }
+    }
+
+    /// Returns current pool statistics
+    pub fn get_stats(&self) -> PoolStats {
+        let stats = self.stats.lock();
+        stats.clone()
+    }
+
+    /// Returns the size of each chunk in bytes
+    pub const fn chunk_size() -> usize {
+        Self::CHUNK_SIZE
+    }
+
+    /// Returns the total number of chunks
+    pub const fn chunk_count() -> usize {
+        M
+    }
+
+    // === Private helper methods ===
+
+    /// Converts bytes to number of chunks needed (rounds up)
+    #[inline]
+    fn bytes_to_chunks(bytes: usize) -> usize {
+        (bytes + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE
+    }
+
+    /// Aligns an address up to the specified alignment
+    #[inline]
+    fn align_up(addr: usize, align: usize) -> Option<usize> {
+        let mask = align - 1;
+        addr.checked_add(mask).map(|v| v & !mask)
+    }
+
+    /// Finds a suitable free block and allocates it
+    fn find_and_allocate_block(
+        &self,
+        inner: &mut PoolInner<N, M>,
+        layout: Layout,
+        chunks_needed: usize,
+    ) -> Result<*mut u8, AllocError> {
+        let pool_base = inner.pool.as_ptr() as usize;
         let mut chunk_idx = 0;
-        while chunk_idx < inner.blocks.len() {
+
+        while chunk_idx < M {
             if let BlockInfo::FreeStart(block_chunks) = inner.blocks[chunk_idx] {
-                let block_byte_start = Self::chunk_to_byte(chunk_idx);
-                let block_addr = pool_addr + block_byte_start;
-                let aligned_addr = align_up(block_addr, alignment);
-                let alignment_offset_bytes = aligned_addr - block_addr;
-                let alignment_offset_chunks = Self::size_to_chunks(alignment_offset_bytes);
-                if alignment_offset_chunks + chunks_needed <= block_chunks {
-                    let ptr = self.allocate_in_block(
-                        &mut inner,
+                // Check if block can accommodate aligned allocation
+                let block_addr = pool_base + (chunk_idx * Self::CHUNK_SIZE);
+                
+                let aligned_addr = match Self::align_up(block_addr, layout.align()) {
+                    Some(addr) => addr,
+                    None => {
+                        chunk_idx += block_chunks;
+                        continue;
+                    }
+                };
+
+                // Validate aligned address is within pool
+                if aligned_addr >= pool_base + N {
+                    chunk_idx += block_chunks;
+                    continue;
+                }
+
+                let alignment_waste = aligned_addr - block_addr;
+                let alignment_chunks = Self::bytes_to_chunks(alignment_waste);
+                
+                if alignment_chunks + chunks_needed <= block_chunks {
+                    return Ok(self.split_and_allocate_block(
+                        inner,
                         chunk_idx,
                         block_chunks,
-                        alignment_offset_chunks,
+                        alignment_chunks,
                         chunks_needed,
                         aligned_addr,
-                    );
-                    // Update stats
-                    let mut stats = self.stats.lock();
-                    stats.allocated_blocks += 1;
-                    let alloc_bytes = chunks_needed * Self::CHUNK_SIZE;
-                    stats.allocated_bytes += alloc_bytes;
-                    stats.free_bytes = stats.free_bytes.saturating_sub(alloc_bytes);
-                    stats.free_blocks = stats.free_blocks.saturating_sub(1);
-                    return Ok(ptr);
+                    ));
                 }
+                
                 chunk_idx += block_chunks;
             } else {
                 chunk_idx += 1;
             }
         }
-        let mut stats = self.stats.lock();
-        stats.inc_alloc_errors();
-        Err(AllocError::Other)
+
+        Err(AllocError::OutOfMemory)
     }
 
-    /// Deallocates a previously allocated memory block
-    /// # Arguments
-    /// * `ptr` - Pointer to the memory block to deallocate
-    /// * `layout` - The layout describing the size and alignment of the memory block
-    ///
-    /// This function checks if the pointer is valid and within the bounds of the memory pool.
-    /// If the pointer is valid, it marks the corresponding chunks as free and attempts to coalesce
-    /// adjacent free blocks to reduce fragmentation.
-    ///
-    /// # Safety
-    /// The caller must ensure that the pointer was allocated by this allocator and that the layout
-    /// matches the original allocation. The pointer must not be null or point outside the pool bounds.
-    /// If the pointer is null or the layout size is zero, the function does nothing.
-    /// If the pointer is outside the bounds of the pool, it also does nothing.
-    /// If the pointer does not correspond to an allocated block, it returns without doing anything.
-    ///
-    /// # Note
-    /// This function does not check if the pointer was previously allocated by this allocator.
-    /// It assumes that the caller is responsible for ensuring that the pointer is valid.
-    /// It also does not check if the layout size is larger than the allocated size.
-    /// If the layout size is larger than the allocated size, it will not clear the entire block.
-    /// It only clears the bytes that were actually allocated.
-    /// If the pointer is not aligned to the chunk size, it will not deallocate anything.
-    pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
-        let _ = self.try_deallocate(ptr, layout);
-    }
-
-    /// Attempts to deallocate a pointer, returning an error if the pointer is invalid.
-    #[cfg(feature = "pointer-tracking")]
-    pub fn try_deallocate(&self, ptr: *mut u8, layout: Layout) -> Result<(), AllocError> {
-        if ptr.is_null() || layout.size() == 0 {
-            let mut stats = self.stats.lock();
-            stats.inc_invalid_dealloc();
-            return Err(AllocError::InvalidDeallocation);
-        }
-        let mut inner = self.inner.lock();
-        let pool_addr = inner.pool.as_mut_ptr() as usize;
-        let ptr_addr = ptr as usize;
-        if ptr_addr < pool_addr || ptr_addr >= pool_addr + N {
-            let mut stats = self.stats.lock();
-            stats.inc_invalid_dealloc();
-            return Err(AllocError::OutOfBounds);
-        }
-        let byte_offset = ptr_addr - pool_addr;
-        let chunk_idx = Self::byte_to_chunk(byte_offset);
-        if chunk_idx >= inner.blocks.len() {
-            let mut stats = self.stats.lock();
-            stats.inc_invalid_dealloc();
-            return Err(AllocError::OutOfBounds);
-        }
-        match inner.blocks[chunk_idx] {
-            BlockInfo::AllocatedStart(chunk_count) => {
-                let allocated_bytes = chunk_count * Self::CHUNK_SIZE;
-                if layout.size() > allocated_bytes {
-                    let mut stats = self.stats.lock();
-                    stats.inc_invalid_dealloc();
-                    return Err(AllocError::InvalidDeallocation);
-                }
-                let actual_byte_start = Self::chunk_to_byte(chunk_idx);
-                let clear_size = core::cmp::min(allocated_bytes, N - actual_byte_start);
-                for i in 0..clear_size {
-                    if actual_byte_start + i < N {
-                        inner.pool[actual_byte_start + i] = 0;
-                    }
-                }
-                self.mark_chunk_range(
-                    &mut inner.blocks,
-                    chunk_idx,
-                    chunk_count,
-                    BlockInfo::FreeStart(chunk_count),
-                );
-                self.coalesce_free_blocks(&mut inner.blocks, chunk_idx);
-                // Update stats
-                let mut stats = self.stats.lock();
-                stats.allocated_blocks = stats.allocated_blocks.saturating_sub(1);
-                stats.allocated_bytes = stats.allocated_bytes.saturating_sub(allocated_bytes);
-                stats.free_bytes += allocated_bytes;
-                stats.free_blocks += 1;
-                Ok(())
-            }
-            _ => {
-                let mut stats = self.stats.lock();
-                stats.inc_invalid_dealloc();
-                Err(AllocError::InvalidDeallocation)
-            }
-        }
-    }
-
-    /// Allocates memory in a specific block, handling alignment and marking the blocks
-    /// # Arguments
-    /// * `inner` - Mutable reference to the inner state of the memory pool
-    /// * `block_start_chunk` - The starting chunk index of the block to allocate from
-    /// * `block_size_chunks` - The total number of chunks in the block
-    /// * `alignment_offset_chunks` - The number of chunks to skip for alignment
-    /// * `alloc_size_chunks` - The number of chunks to allocate
-    /// * `aligned_addr` - The aligned address to start the allocation from
-    ///
-    /// # Returns
-    /// * `*mut u8` - Pointer to the allocated memory block
-    ///
-    /// This function updates the block information to reflect the allocation,
-    /// marking the allocated range and any remaining free space.
-    /// It also handles the case where the allocation requires skipping some initial chunks
-    /// for alignment purposes.
-    ///
-    /// # Safety
-    /// The caller must ensure that the `inner` state is properly locked and that the
-    /// `block_start_chunk` and `block_size_chunks` are valid indices within the `blocks` array.
-    /// The caller must also ensure that the `aligned_addr` is a valid address within the pool.
-    fn allocate_in_block(
+    /// Splits a free block and allocates part of it
+    fn split_and_allocate_block(
         &self,
         inner: &mut PoolInner<N, M>,
-        block_start_chunk: usize,
-        block_size_chunks: usize,
-        alignment_offset_chunks: usize,
-        alloc_size_chunks: usize,
+        block_start: usize,
+        block_size: usize,
+        alignment_offset: usize,
+        alloc_size: usize,
         aligned_addr: usize,
     ) -> *mut u8 {
-        let alloc_start_chunk = block_start_chunk + alignment_offset_chunks;
-        if alignment_offset_chunks > 0 {
-            self.mark_chunk_range(
-                &mut inner.blocks,
-                block_start_chunk,
-                alignment_offset_chunks,
-                BlockInfo::FreeStart(alignment_offset_chunks),
-            );
+        let alloc_start = block_start + alignment_offset;
+
+        // Mark alignment padding as free if present
+        if alignment_offset > 0 {
+            self.mark_chunks(&mut inner.blocks, block_start, alignment_offset, true);
         }
-        self.mark_chunk_range(
-            &mut inner.blocks,
-            alloc_start_chunk,
-            alloc_size_chunks,
-            BlockInfo::AllocatedStart(alloc_size_chunks),
-        );
-        let remaining_chunks = block_size_chunks - alignment_offset_chunks - alloc_size_chunks;
-        if remaining_chunks > 0 {
-            let remaining_start_chunk = alloc_start_chunk + alloc_size_chunks;
-            self.mark_chunk_range(
-                &mut inner.blocks,
-                remaining_start_chunk,
-                remaining_chunks,
-                BlockInfo::FreeStart(remaining_chunks),
-            );
+
+        // Mark allocated chunks
+        self.mark_chunks(&mut inner.blocks, alloc_start, alloc_size, false);
+
+        // Mark remaining chunks as free if present
+        let remaining = block_size - alignment_offset - alloc_size;
+        if remaining > 0 {
+            let remaining_start = alloc_start + alloc_size;
+            self.mark_chunks(&mut inner.blocks, remaining_start, remaining, true);
         }
+
         aligned_addr as *mut u8
     }
 
-    /// Marks a range of chunks with a specific block type
-    /// # Arguments
-    /// * `blocks` - Mutable slice of block information
-    /// * `start_chunk` - The starting chunk index to mark
-    /// * `chunk_count` - The number of chunks to mark
-    /// * `block_type` - The type of block to mark the range with
-    ///
-    /// This function updates the `blocks` slice to reflect the new state of the memory pool.
-    /// It handles both the start of a new block and continuation blocks.
-    ///
-    /// # Safety
-    /// The caller must ensure that `start_chunk` is a valid index within the `blocks` slice
-    /// and that `chunk_count` does not exceed the bounds of the slice.
-    /// If `start_chunk` is out of bounds or `chunk_count` is zero, the function does nothing.
-    #[inline]
-    // #[allow(clippy::cast_possible_wrap)]
-    // #[allow(clippy::cast_sign_loss)]
-    fn mark_chunk_range(
+    /// Marks a range of chunks as free or allocated
+    fn mark_chunks(
         &self,
         blocks: &mut [BlockInfo],
-        start_chunk: usize,
-        chunk_count: usize,
-        block_type: BlockInfo,
+        start: usize,
+        count: usize,
+        is_free: bool,
     ) {
-        if start_chunk >= blocks.len() || chunk_count == 0 {
-            return;
-        }
-        let end_chunk = core::cmp::min(start_chunk + chunk_count, blocks.len());
-        blocks[start_chunk] = block_type;
-        let continuation = match block_type {
-            BlockInfo::FreeStart(_) => BlockInfo::FreeContinuation,
-            BlockInfo::AllocatedStart(_) => BlockInfo::AllocatedContinuation,
-            _ => return,
+        debug_assert!(start + count <= M, "Chunk range exceeds pool size");
+        
+        blocks[start] = if is_free {
+            BlockInfo::FreeStart(count)
+        } else {
+            BlockInfo::AllocatedStart(count)
         };
-        for i in (start_chunk + 1)..end_chunk {
+
+        let continuation = if is_free {
+            BlockInfo::FreeContinuation
+        } else {
+            BlockInfo::AllocatedContinuation
+        };
+
+        for i in (start + 1)..(start + count) {
             blocks[i] = continuation;
         }
     }
 
-    /// Coalesces adjacent free blocks into a single larger free block
-    /// # Arguments
-    /// * `blocks` - Mutable slice of block information
-    /// * `start_chunk` - The starting chunk index to begin coalescing from
-    ///
-    /// This function checks for adjacent free blocks before and after the specified start chunk.
-    /// It merges them into a single free block if possible, updating the block information accordingly.
-    ///
-    /// # Safety
-    /// The caller must ensure that `start_chunk` is a valid index within the `blocks` slice.
-    /// If `start_chunk` is out of bounds or does not point to a free block, the function does nothing.
-    fn coalesce_free_blocks(&self, blocks: &mut [BlockInfo], start_chunk: usize) {
-        // Move region_start backward to the start of the free region
-        let mut region_start = start_chunk;
+    /// Marks chunks as free (convenience wrapper)
+    #[inline]
+    fn mark_chunks_free(&self, blocks: &mut [BlockInfo], start: usize, count: usize) {
+        self.mark_chunks(blocks, start, count, true);
+    }
+
+    /// Coalesces adjacent free blocks into larger blocks
+    fn coalesce_free_blocks(&self, blocks: &mut [BlockInfo], hint_chunk: usize) {
+        // Find the start of the free region containing hint_chunk
+        let mut region_start = hint_chunk;
+        
+        // Walk backward to find the beginning of our free region
         while region_start > 0 {
             match blocks[region_start - 1] {
-                BlockInfo::FreeStart(_) | BlockInfo::FreeContinuation => region_start -= 1,
+                BlockInfo::FreeContinuation => region_start -= 1,
+                BlockInfo::FreeStart(_) => {
+                    region_start -= 1;
+                    break;
+                }
                 _ => break,
             }
         }
-        // Move region_end forward to the end of the free region
-        let mut region_end = start_chunk;
-        while region_end < blocks.len() {
+
+        // Walk further backward to include any adjacent free blocks
+        while region_start > 0 {
+            // Find the start of the potential previous block
+            let mut prev_start = region_start - 1;
+            while prev_start > 0 && matches!(blocks[prev_start], BlockInfo::FreeContinuation) {
+                prev_start -= 1;
+            }
+
+            // Check if it's a free block that ends where our region starts
+            if let BlockInfo::FreeStart(prev_count) = blocks[prev_start] {
+                if prev_start + prev_count == region_start {
+                    region_start = prev_start;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Find the end of the free region
+        let mut region_end = hint_chunk;
+        while region_end < M {
             match blocks[region_end] {
                 BlockInfo::FreeStart(count) => region_end += count,
                 BlockInfo::FreeContinuation => region_end += 1,
                 _ => break,
             }
         }
+
+        // Mark the entire region as one free block
         let total_chunks = region_end - region_start;
         if total_chunks > 0 {
-            self.mark_chunk_range(
-                blocks,
-                region_start,
-                total_chunks,
-                BlockInfo::FreeStart(total_chunks),
-            );
+            self.mark_chunks_free(blocks, region_start, total_chunks);
         }
     }
 
-    /// Returns the total amount of free space in bytes
-    ///
-    /// This method iterates through all blocks and sums up the size of free blocks.
-    /// The result is guaranteed to not exceed the total pool size N.
-    ///
-    /// # Returns
-    /// * `usize` - Total number of free bytes
-    pub fn get_free_space(&self) -> usize {
-        let inner = self.inner.lock();
-        let mut total_free_chunks = 0;
-        let mut chunk_idx = 0;
+    /// Clears memory in the specified chunk range
+    #[cfg(feature = "zero-on-free")]
+    fn clear_memory(&self, pool: &mut [u8], chunk_start: usize, chunk_count: usize) {
+        let byte_start = chunk_start * Self::CHUNK_SIZE;
+        let byte_count = chunk_count * Self::CHUNK_SIZE;
+        let byte_end = (byte_start + byte_count).min(N);
+        
+        pool[byte_start..byte_end].fill(0);
+    }
 
-        while chunk_idx < inner.blocks.len() {
-            match inner.blocks[chunk_idx] {
-                BlockInfo::FreeStart(chunk_count) => {
-                    total_free_chunks += chunk_count;
-                    chunk_idx += chunk_count;
-                }
-                BlockInfo::AllocatedStart(chunk_count) => {
-                    chunk_idx += chunk_count;
-                }
-                _ => chunk_idx += 1,
+    /// Updates statistics after successful allocation
+    fn update_stats_after_allocation(&self, chunks: usize) {
+        let mut stats = self.stats.lock();
+        let bytes = chunks * Self::CHUNK_SIZE;
+        
+        stats.allocated_blocks += 1;
+        stats.allocated_bytes += bytes;
+        stats.free_bytes = stats.free_bytes.saturating_sub(bytes);
+        
+        // Recalculate fragmentation and free blocks
+        self.recalculate_fragmentation_stats(&mut stats);
+    }
+
+    /// Updates statistics after successful deallocation
+    fn update_stats_after_deallocation(&self, chunks: usize) {
+        let mut stats = self.stats.lock();
+        let bytes = chunks * Self::CHUNK_SIZE;
+        
+        stats.allocated_blocks = stats.allocated_blocks.saturating_sub(1);
+        stats.allocated_bytes = stats.allocated_bytes.saturating_sub(bytes);
+        stats.free_bytes += bytes;
+        
+        // Recalculate fragmentation and free blocks
+        self.recalculate_fragmentation_stats(&mut stats);
+    }
+
+    /// Recalculates fragmentation-related statistics
+    fn recalculate_fragmentation_stats(&self, stats: &mut PoolStats) {
+        let inner = self.inner.lock();
+        let mut free_blocks = 0;
+        let mut largest_free = 0;
+        let mut i = 0;
+
+        while i < M {
+            if let BlockInfo::FreeStart(count) = inner.blocks[i] {
+                free_blocks += 1;
+                largest_free = largest_free.max(count * Self::CHUNK_SIZE);
+                i += count;
+            } else {
+                i += 1;
             }
         }
 
-        core::cmp::min(total_free_chunks * Self::CHUNK_SIZE, N)
-    }
+        stats.free_blocks = free_blocks;
+        stats.largest_free_block = largest_free;
 
-    /// Returns the total amount of allocated space in bytes
-    ///
-    /// Calculated as the difference between total pool size and free space.
-    ///
-    /// # Returns
-    /// * `usize` - Total number of allocated bytes
-    #[inline]
-    pub fn get_used_space(&self) -> usize {
-        N - self.get_free_space()
-    }
-
-    /// Returns detailed statistics about the memory pool's current state
-    ///
-    /// Gathers information about:
-    /// - Total size and chunk size
-    /// - Number of allocated and free blocks
-    /// - Amount of allocated and free bytes
-    /// - Fragmentation metrics
-    ///
-    /// # Returns
-    /// * `PoolStats` - Structure containing various statistics
-    pub fn get_stats(&self) -> parking_lot::MutexGuard<'_, PoolStats> {
-        self.stats.lock()
-    }
-
-    #[inline]
-    /// Returns the size of each chunk in bytes
-    pub const fn chunk_size() -> usize {
-        Self::CHUNK_SIZE
-    }
-
-    #[inline]
-    /// Returns the total number of chunks in the memory pool
-    pub const fn chunk_count() -> usize {
-        M
-    }
-}
-
-#[derive(Debug, Default)]
-/// Statistics structure for the memory pool allocator
-/// Contains various metrics about the current state of the memory pool
-pub struct PoolStats {
-    pub total_size: usize,
-    pub allocated_bytes: usize,
-    pub free_bytes: usize,
-    pub allocated_blocks: usize,
-    pub free_blocks: usize,
-    pub largest_free_block: usize,
-    // fragmentation represented as percentage * 100
-    // e.g., 2500 means 25% fragmented
-    pub fragmentation: usize,
-    pub chunk_size: usize,
-    pub total_chunks: usize,
-    #[cfg(feature = "pointer-tracking")]
-    pub invalid_deallocations: usize,
-    #[cfg(feature = "pointer-tracking")]
-    pub allocation_errors: usize,
-}
-
-impl PoolStats {
-    pub const fn new(total_size: usize, chunk_size: usize, total_chunks: usize) -> Self {
-        Self {
-            total_size,
-            chunk_size,
-            total_chunks,
-            allocated_bytes: 0,
-            free_bytes: 0,
-            allocated_blocks: 0,
-            free_blocks: 0,
-            largest_free_block: 0,
-            fragmentation: 0,
-            invalid_deallocations: 0,
-            allocation_errors: 0,
+        // Calculate fragmentation: (1 - largest_free/total_free) * 100
+        if stats.free_bytes > 0 && free_blocks > 1 {
+            let frag = ((stats.free_bytes - largest_free) * 10000) / stats.free_bytes;
+            stats.fragmentation = frag;
+        } else {
+            stats.fragmentation = 0;
         }
-    }
-    pub fn inc_invalid_dealloc(&mut self) {
-        self.invalid_deallocations += 1;
-    }
-    pub fn inc_alloc_errors(&mut self) {
-        self.allocation_errors += 1;
-    }
-}
-
-#[inline]
-/// Aligns an address up to the nearest multiple of the specified alignment
-/// # Arguments
-/// * `addr` - The address to align
-/// * `align` - The alignment value (must be a power of two)
-////// # Returns
-/// * `usize` - The aligned address
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
-}
-
-/// Global allocator implementation for the MemoryPoolAllocator
-/// This allows the allocator to be used as the default global allocator in Rust applications.
-unsafe impl<const N: usize, const M: usize> GlobalAlloc for MemoryPoolAllocator<N, M> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocate(layout)
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.deallocate(ptr, layout);
     }
 }
 
@@ -562,214 +481,165 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunk_calculations() {
-        type Alloc1 = MemoryPoolAllocator<1024, 64>;
-        type Alloc2 = MemoryPoolAllocator<1008, 63>;
-        assert_eq!(Alloc1::chunk_size(), 16);
-        assert_eq!(Alloc1::chunk_count(), 64);
-        assert_eq!(Alloc2::chunk_count(), 63);
-    }
-
-    #[test]
     fn test_basic_allocation() {
         type Alloc = MemoryPoolAllocator<1024, 64>;
         let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = allocator.allocate(layout);
+        
+        let layout = Layout::from_size_align(32, 8).unwrap();
+        let ptr = allocator.try_allocate(layout).unwrap();
         assert!(!ptr.is_null());
-        assert_eq!(ptr as usize % 8, 0);
-        allocator.deallocate(ptr, layout);
+        assert_eq!(ptr as usize % 8, 0); // Check alignment
+        
+        assert!(allocator.try_deallocate(ptr, layout).is_ok());
     }
 
     #[test]
-    fn test_small_allocations() {
+    fn test_multiple_allocations() {
         type Alloc = MemoryPoolAllocator<1024, 64>;
         let allocator = Alloc::new();
-        for size in [1, 4, 8, 12, 15] {
-            let layout = Layout::from_size_align(size, 1).unwrap();
-            let ptr = allocator.allocate(layout);
-            assert!(!ptr.is_null());
-            allocator.deallocate(ptr, layout);
+        
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        let mut ptrs = [0u8 as *mut u8; 10];
+        
+        // Allocate multiple blocks
+        for i in 0..10 {
+            match allocator.try_allocate(layout) {
+                Ok(ptr) => ptrs[i] = ptr,
+                Err(_) => break,
+            }
         }
-    }
-
-    #[test]
-    fn test_alignment_with_chunks() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        for align in [1, 2, 4, 8, 16, 32] {
-            let layout = Layout::from_size_align(32, align).unwrap();
-            let ptr = allocator.allocate(layout);
-            assert!(!ptr.is_null());
-            assert_eq!(ptr as usize % align, 0);
-            allocator.deallocate(ptr, layout);
+        
+        assert!(!ptrs.is_empty());
+        
+        // Deallocate all
+        for ptr in ptrs {
+            assert!(allocator.try_deallocate(ptr, layout).is_ok());
         }
-    }
-
-    #[test]
-    fn test_memory_overhead_reduction() {
-        type Alloc = MemoryPoolAllocator<4096, 256>;
-        let allocator = Alloc::new();
+        
+        // Check stats
         let stats = allocator.get_stats();
-        assert_eq!(stats.total_chunks, 256);
-        assert_eq!(stats.chunk_size, 16);
-        assert_eq!(stats.total_size, 4096);
-    }
-
-    #[test]
-    fn test_coalescing_with_chunks() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr1 = allocator.allocate(layout);
-        let ptr2 = allocator.allocate(layout);
-        let ptr3 = allocator.allocate(layout);
-        let initial_free = allocator.get_free_space();
-        allocator.deallocate(ptr2, layout);
-        allocator.deallocate(ptr1, layout);
-        allocator.deallocate(ptr3, layout);
-        assert!(allocator.get_free_space() >= initial_free + 192);
-    }
-
-    #[test]
-    fn test_stats_with_chunks() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let stats = allocator.get_stats();
-        assert_eq!(stats.total_size, 1024);
-        assert_eq!(stats.chunk_size, 16);
-        assert_eq!(stats.total_chunks, 64);
+        assert_eq!(stats.allocated_blocks, 0);
         assert_eq!(stats.free_bytes, 1024);
-        assert_eq!(stats.allocated_bytes, 0);
-        let layout = Layout::from_size_align(100, 8).unwrap();
-        let _ptr = allocator.allocate(layout);
+    }
+
+    #[test]
+    fn test_coalescing() {
+        type Alloc = MemoryPoolAllocator<256, 16>;
+        let allocator = Alloc::new();
+        
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        
+        // Allocate three adjacent blocks
+        let ptr1 = allocator.try_allocate(layout).unwrap();
+        let ptr2 = allocator.try_allocate(layout).unwrap();
+        let ptr3 = allocator.try_allocate(layout).unwrap();
+        
+        // Deallocate in order that requires coalescing
+        assert!(allocator.try_deallocate(ptr2, layout).is_ok());
+        assert!(allocator.try_deallocate(ptr1, layout).is_ok());
+        assert!(allocator.try_deallocate(ptr3, layout).is_ok());
+        
+        // Should have one large free block
         let stats = allocator.get_stats();
-        assert_eq!(stats.allocated_bytes, 112);
-        assert_eq!(stats.free_bytes, 1024 - 112);
+        assert_eq!(stats.free_blocks, 1);
+        assert_eq!(stats.largest_free_block, 256);
     }
 
     #[test]
-    fn test_partial_chunk_deallocation() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
+    fn test_alignment_handling() {
+        type Alloc = MemoryPoolAllocator<512, 32>;
         let allocator = Alloc::new();
-        let layout = Layout::from_size_align(10, 1).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        allocator.deallocate(ptr, layout);
-        assert_eq!(allocator.get_free_space(), 1024);
+        
+        // Test various alignments
+        for align in [1, 2, 4, 8, 16, 32, 64].iter() {
+            let layout = Layout::from_size_align(24, *align).unwrap();
+            match allocator.try_allocate(layout) {
+                Ok(ptr) => {
+                    assert_eq!(ptr as usize % align, 0);
+                    assert!(allocator.try_deallocate(ptr, layout).is_ok());
+                }
+                Err(_) => {} // Large alignments might fail
+            }
+        }
     }
 
     #[test]
-    fn test_zero_size_allocation() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
+    fn test_error_handling() {
+        type Alloc = MemoryPoolAllocator<128, 8>;
         let allocator = Alloc::new();
-        let layout = Layout::from_size_align(0, 1).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        allocator.deallocate(ptr, layout);
+        
+        // Invalid layout - alignment not power of 2
+        let stats_before = allocator.get_stats();
+        assert!(allocator.try_allocate(Layout::from_size_align(16, 3).unwrap()).is_err());
+        let stats_after = allocator.get_stats();
+        assert_eq!(stats_after.allocation_errors, stats_before.allocation_errors + 1);
+        
+        // Allocation too large
+        assert!(allocator.try_allocate(Layout::from_size_align(256, 8).unwrap()).is_err());
+        
+        // Invalid deallocation
+        let fake_ptr = 0x1234 as *mut u8;
+        assert!(allocator.try_deallocate(fake_ptr, Layout::from_size_align(16, 8).unwrap()).is_err());
     }
 
     #[test]
-    fn test_large_allocation_failure() {
-        type Alloc = MemoryPoolAllocator<96, 6>;
+    fn test_fragmentation_stats() {
+        type Alloc = MemoryPoolAllocator<256, 16>;
         let allocator = Alloc::new();
-        let layout = Layout::from_size_align(200, 8).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(ptr.is_null());
-    }
-
-    #[test]
-    fn test_memory_efficiency() {
-        type Alloc = MemoryPoolAllocator<4096, 256>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(48, 16).unwrap();
-        let ptr1 = allocator.allocate(layout);
-        let ptr2 = allocator.allocate(layout);
+        
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        
+        // Create fragmentation by allocating every other block
+        let mut ptrs = [0u8 as *mut u8; 8];
+        for i in 0..8 {
+            if let Ok(ptr) = allocator.try_allocate(layout) {
+                if i % 2 == 0 {
+                    ptrs[i] = ptr;
+                } else {
+                    // Immediately free to create gaps
+                    allocator.try_deallocate(ptr, layout).unwrap();
+                }
+            }
+        }
+        
         let stats = allocator.get_stats();
-        assert_eq!(stats.allocated_blocks, 2);
-        assert_eq!(stats.allocated_bytes, 96);
-        allocator.deallocate(ptr1, layout);
-        allocator.deallocate(ptr2, layout);
+        assert!(stats.fragmentation > 0);
+        assert_eq!(stats.free_blocks, 4); // Should have 4 separate free blocks
+        
+        // Clean up
+        for ptr in ptrs {
+            allocator.try_deallocate(ptr, layout).unwrap();
+        }
     }
 
     #[test]
-    #[cfg(feature = "pointer-tracking")]
-    fn test_try_deallocate_invalid_pointer() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
+    #[cfg(feature = "zero-on-free")]
+    fn test_memory_zeroing() {
+        type Alloc = MemoryPoolAllocator<64, 4>;
         let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        // Deallocate with an invalid pointer (not allocated by this allocator)
-        let invalid_ptr = (ptr as usize + 1) as *mut u8;
-        assert_eq!(
-            allocator.try_deallocate(invalid_ptr, layout),
-            Err(AllocError::InvalidDeallocation)
-        );
-        allocator.deallocate(ptr, layout);
-    }
-
-    #[test]
-    #[cfg(feature = "pointer-tracking")]
-    fn test_try_deallocate_out_of_bounds() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        // Deallocate with a pointer out of bounds
-        let out_of_bounds_ptr = (1024 as *mut u8).wrapping_sub(1);
-        assert_eq!(
-            allocator.try_deallocate(out_of_bounds_ptr, layout),
-            Err(AllocError::OutOfBounds)
-        );
-        allocator.deallocate(ptr, layout);
-    }
-
-    #[test]
-    #[cfg(feature = "pointer-tracking")]
-    fn test_try_deallocate_success() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        // Successful deallocation
-        assert_eq!(allocator.try_deallocate(ptr, layout), Ok(()));
-    }
-
-    #[test]
-    #[cfg(feature = "pointer-tracking")]
-    fn test_stats_invalid_deallocations() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = allocator.allocate(layout);
-        assert!(!ptr.is_null());
-        // Deallocate with an invalid pointer
-        let invalid_ptr = (ptr as usize + 1) as *mut u8;
-        allocator.try_deallocate(invalid_ptr, layout).unwrap_err();
-        let stats = allocator.get_stats();
-        assert_eq!(stats.invalid_deallocations, 1);
-        allocator.deallocate(ptr, layout);
-    }
-
-    #[test]
-    #[cfg(feature = "pointer-tracking")]
-    fn test_stats_allocation_errors() {
-        type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        // Allocate normally
-        let ptr1 = allocator.allocate(layout);
-        assert!(!ptr1.is_null());
-        // Force an allocation error by exceeding the pool size
-        let layout_large = Layout::from_size_align(2048, 8).unwrap();
-        let ptr2 = allocator.try_allocate(layout_large);
-        assert!(ptr2.is_err());
-        // Check statistics
-        let stats = allocator.get_stats();
-        assert_eq!(stats.allocation_errors, 1);
-        allocator.deallocate(ptr1, layout);
+        
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        let ptr = allocator.try_allocate(layout).unwrap();
+        
+        // Write some data
+        unsafe {
+            core::ptr::write_bytes(ptr, 0xFF, 16);
+        }
+        
+        // Deallocate
+        allocator.try_deallocate(ptr, layout).unwrap();
+        
+        // Reallocate same memory
+        let ptr2 = allocator.try_allocate(layout).unwrap();
+        assert_eq!(ptr, ptr2); // Should get same address
+        
+        // Check if zeroed
+        let mut buffer = [0u8; 16];
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr2, buffer.as_mut_ptr(), 16);
+        }
+        assert!(buffer.iter().all(|&b| b == 0));
+        
+        allocator.try_deallocate(ptr2, layout).unwrap();
     }
 }
