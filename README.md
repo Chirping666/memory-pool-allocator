@@ -1,6 +1,6 @@
 # memory-pool-allocator
 
-A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chunk sizes and efficient allocation/deallocation. Made mostly using a mix of generative AI tools, such as Claude and Copilot.
+A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chunk sizes and efficient allocation/deallocation. Made with the help of AI such as Claude and Copilot.
 
 ## Features
 - No_std compatible
@@ -35,7 +35,9 @@ allocator.deallocate(ptr, layout);
 
 ## Safety
 - `N` (total bytes) must be exactly divisible by `M` (number of chunks).
-- The allocator does not track ownership of pointers; the user must ensure only valid pointers are deallocated.
+
+## Features
+There are two default features, `zero-on-free` and `statistics`, that are enabled by default. The first feature, `zero-on-free`, ensures that the memory associated with the pointer is set to zero on deallocation. The second feature, `statistics`, ensures that the number of allocated chunks, as well as the allocation and deallocation errors, are tracked. 
 
 ## License
 Licensed under either of
