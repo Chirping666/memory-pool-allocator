@@ -8,7 +8,9 @@ A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chun
 - Dual-licensed (Apache-2.0 OR MIT)
 - Customizable pool size and chunk count via const generics
 - Fast allocation and deallocation for fixed-size blocks
-- Fragmentation and usage statistics
+- Usage statistics
+- User-provided memory pool (via ```rust *mut u8 ```)
+- Default features: `zero-on-free`, `zero-on-drop` and `statistics`.
 
 ## Usage
 
@@ -16,28 +18,43 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-memory-pool-allocator = "0.1"
+memory-pool-allocator = "1.0"
+```
+
+Or, if you do not want statistics and zeroing, add:
+```toml
+[dependencies]
+memory-pool-allocator = { version = "1.0", default-features = false }
 ```
 
 Example:
 
 ```rust
 use memory_pool_allocator::MemoryPoolAllocator;
+use core::alloc::Layout;
 
-// Create a 1024-byte pool divided into 64 chunks (16 bytes each)
-let allocator = MemoryPoolAllocator::<1024, 64>::new();
-
-let layout = core::alloc::Layout::from_size_align(32, 8).unwrap();
-let ptr = allocator.allocate(layout);
-assert!(!ptr.is_null());
-allocator.deallocate(ptr, layout);
+#[repr(align(64))]
+struct Aligned {
+    mem: [u8; 1024]
+}
+let mut aligned = Aligned { mem: [0; 1024] };
+let allocator = unsafe { MemoryPoolAllocator::<1024, 64>::new(aligned.mem.as_mut_ptr()) };
+let layout = Layout::from_size_align(128, 64).unwrap();
+let ptr = allocator.try_allocate(layout).unwrap();
+assert_eq!(ptr as usize % 64, 0);
+allocator.try_deallocate(ptr).unwrap();
 ```
 
 ## Safety
+- The user must provide a pointer to a memory region of at least `N` bytes, aligned to the maximum alignment required by allocations.
+- The allocator does not manage the lifetime of the memory pool; the user is responsible for ensuring it is valid for the allocator's lifetime.
+- If the pool is not sufficiently aligned, allocations with higher alignment requirements may fail or result in undefined behavior.
 - `N` (total bytes) must be exactly divisible by `M` (number of chunks).
 
-## Features
-There are two default features, `zero-on-free` and `statistics`, that are enabled by default. The first feature, `zero-on-free`, ensures that the memory associated with the pointer is set to zero on deallocation. The second feature, `statistics`, ensures that the number of allocated chunks, as well as the allocation and deallocation errors, are tracked. 
+## Default Features
+- **zero-on-free**: Zeroes memory of each allocation when it is deallocated.
+- **zero-on-drop**: Zeroes the entire memory pool when the allocator is dropped.
+- **statistics**: Tracks allocation and deallocation statistics (number of allocated chunks, allocation/deallocation errors).
 
 ## License
 Licensed under either of

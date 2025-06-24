@@ -1,6 +1,6 @@
 [package]
 name = "memory-pool-allocator"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ anyhow = { version = "1.0", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 
 [features]
-default = ["zero-on-free", "statistics"]
+default = ["zero-on-free", "zero-on-drop", "statistics"]
 zero-on-free = []
+zero-on-drop = []
 statistics = []

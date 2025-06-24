@@ -1,3 +1,46 @@
+//! # memory-pool-allocator
+//!
+//! A no_std, thread-safe, array chunk tracking-based fixed-size memory pool allocator.
+//!
+//! ## Features
+//! - User-provided memory pool (via `*mut u8`)
+//! - Chunked allocation with array-based chunk tracking
+//! - Optional statistics and zero-on-free features
+//! - Thread-safe via `parking_lot::Mutex`
+//!
+//! ### Default Features
+//! - **zero-on-free**: Zeroes memory of each allocation when it is deallocated.
+//! - **zero-on-drop**: Zeroes the entire memory pool when the allocator is dropped.
+//! - **statistics**: Tracks allocation and deallocation statistics (number of allocated chunks, allocation/deallocation errors).
+//!
+//! ## Type Parameters
+//! - `N`: Total pool size in bytes
+//! - `M`: Number of chunks to divide the pool into
+//!
+//! ## Safety
+//! - The user must provide a pointer to a memory region of at least `N` bytes, aligned to the maximum alignment required by allocations.
+//! - The allocator does not manage the lifetime of the memory pool; the user is responsible for ensuring it is valid for the allocator's lifetime.
+//! - If the pool is not sufficiently aligned, allocations with higher alignment requirements may fail or result in undefined behavior.
+//!
+//! ## Example
+//! ```rust
+//! # use memory_pool_allocator::MemoryPoolAllocator;
+//! # use core::alloc::Layout;
+//! #[repr(align(64))]
+//! struct Aligned {
+//!     mem: [u8; 1024]
+//! }
+//! let mut aligned = Aligned { mem: [0; 1024] };
+//! let allocator = unsafe { MemoryPoolAllocator::<1024, 64>::new(aligned.mem.as_mut_ptr()) };
+//! let layout = Layout::from_size_align(128, 64).unwrap();
+//! let ptr = allocator.try_allocate(layout).unwrap();
+//! assert_eq!(ptr as usize % 64, 0);
+//! allocator.try_deallocate(ptr).unwrap();
+//! ```
+//!
+//! ## License
+//! Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+
 // Copyright 2025 Chirping666
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0>
 // or the MIT license <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
@@ -8,13 +51,12 @@ use anyhow::{anyhow, Result};
 use core::{alloc::Layout, ptr::NonNull};
 use parking_lot::Mutex;
 
-/// Bitmap-based fixed-size memory pool allocator
+/// Array chunk tracking-based fixed-size memory pool allocator
 /// 
 /// # Type Parameters
 /// * `N` - Total pool size in bytes
 /// * `M` - Number of chunks to divide the pool into
 /// 
-/// Uses a bitmap where each bit represents a chunk's allocation status.
 pub struct MemoryPoolAllocator<const N: usize, const M: usize> {
     inner: Mutex<PoolInner<N, M>>,
     #[cfg(feature = "statistics")]
@@ -22,9 +64,9 @@ pub struct MemoryPoolAllocator<const N: usize, const M: usize> {
 }
 
 struct PoolInner<const N: usize, const M: usize> {
-    /// The actual memory pool
-    pool: [u8; N],
-    /// Bitmap tracking allocation status (true = allocated, false = free)
+    /// Pointer to the actual memory pool (user-provided)
+    pool: *mut u8,
+    /// Allocation tracking
     meta: [Option<usize>; M],
 }
 
@@ -90,15 +132,12 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
     /// Size of each chunk in bytes
     pub const CHUNK_SIZE: usize = N / M;
 
-    /// Creates a new memory pool allocator
-    pub const fn new() -> Self {
-        assert!(N % M == 0, "N must be exactly divisible by M");
-        assert!(N > 0 && M > 0, "Pool and chunk count must be positive");
-        assert!(Self::CHUNK_SIZE > 0, "Chunk size must be positive");
-        
+    /// # Safety
+    /// The caller must ensure the pointer is valid for reads/writes of N bytes and properly aligned for all pool operations.
+    pub const unsafe fn new(pool: *mut u8) -> Self {
         Self {
-            inner: Mutex::new(PoolInner { 
-                pool: [0u8; N], 
+            inner: Mutex::new(PoolInner {
+                pool,
                 meta: [None; M],
             }),
             #[cfg(feature = "statistics")]
@@ -132,33 +171,32 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         }
 
         let mut inner = self.inner.lock();
+        let pool_base = inner.pool as usize;
 
         // Find a suitable free region
         if let Some((start_chunk, total_chunks)) = self.find_free_region(&inner, chunks_needed, layout.align()) {
-            // Mark chunks as allocated
             self.mark_allocated(&mut inner.meta, start_chunk, total_chunks)?;
-            
+
             // Calculate pointer address
-            let pool_base = inner.pool.as_ptr() as usize;
             let ptr_addr = pool_base + start_chunk * Self::CHUNK_SIZE;
-            
-            // Update stats
+
             #[cfg(feature = "statistics")]
             {
                 let mut stats = self.stats.lock();
                 stats.allocated_chunks += total_chunks;
             }
-            
             return Ok(ptr_addr as *mut u8);
         }
-        
-        // Find suitable free region
+
+        #[cfg(feature = "statistics")]
+        {
+            self.stats.lock().allocation_errors += 1;
+        }
         Err(anyhow!(AllocError::OutOfMemory).context("Failed to find free region"))
-        
     }
 
     /// Attempts to deallocate previously allocated memory
-    pub fn try_deallocate(&self, ptr: *mut u8, _layout: Layout) -> Result<()> {
+    pub fn try_deallocate(&self, ptr: *mut u8) -> Result<()> {
         // Handle null
         if ptr.is_null() {
             #[cfg(feature = "statistics")]
@@ -169,11 +207,10 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         }
 
         let mut inner = self.inner.lock();
-        
-        // Validate pointer is within pool
-        let pool_base = inner.pool.as_ptr() as usize;
+        let pool_base = inner.pool as usize;
         let ptr_addr = ptr as usize;
-        
+
+        // Validate pointer is within pool
         if ptr_addr < pool_base || ptr_addr >= pool_base + N {
             #[cfg(feature = "statistics")]
             {
@@ -216,13 +253,12 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         #[cfg(feature = "zero-on-free")]
         {
             unsafe {
-                let start_ptr = inner.pool.as_mut_ptr().add(start_chunk * Self::CHUNK_SIZE);
+                let start_ptr = (pool_base + start_chunk * Self::CHUNK_SIZE) as *mut u8;
                 core::ptr::write_bytes(start_ptr, 0, total_chunks * Self::CHUNK_SIZE);
             }
         }
         
         // Mark chunks as free
-        
         self.mark_chunks_free(&mut inner.meta, start_chunk)?;
 
         // Update stats
@@ -281,42 +317,54 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
 
     /// Finds a contiguous free region that can accommodate the request
     fn find_free_region(&self, inner: &PoolInner<N, M>, chunks_needed: usize, align: usize) -> Option<(usize,usize)> {
-        let pool_base = inner.pool.as_ptr() as usize;
-        let mut start = 0;
+
+        let pool_base = inner.pool as usize;
         
+        let mut start = 0;
         while start + chunks_needed <= M {
-            // Check alignment requirements
+            // Calculate the address of the block
             let block_addr = pool_base + start * Self::CHUNK_SIZE;
+            // Check if the block is aligned
             let aligned_addr = (block_addr + align - 1) & !(align - 1);
+            // Check if the aligned address is within bounds
             let alignment_waste = aligned_addr - block_addr;
-            let alignment_chunks = alignment_waste / Self::CHUNK_SIZE;
-            
+            // Round up to next chunk boundary if needed
+            let alignment_chunks = (alignment_waste + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE;
+            // Check if we have enough space after alignment
             let total_chunks_needed = alignment_chunks + chunks_needed;
-            
+            // If we exceed the total number of chunks, break
             if start + total_chunks_needed > M {
-                // Not enough space left in pool
                 break;
             }
-            
-            // Check if we have enough contiguous free chunks
+            // Check if all chunks in the range are free
             let mut found = true;
+            // Check if the start chunk is aligned
             for i in 0..total_chunks_needed {
                 if self.is_chunk_allocated(&inner.meta, start + i) {
                     found = false;
-                    // Skip past this allocated chunk
                     start = start + i + 1;
                     break;
                 }
             }
-            
+            // If we found a free region, return it
             if found {
-                return Some((start, total_chunks_needed));
+                return Some((start + alignment_chunks, chunks_needed));
             }
         }
-        
         None
     }
 
+}
+
+#[cfg(feature = "zero-on-drop")]
+impl<const N: usize, const M: usize> Drop for MemoryPoolAllocator<N, M> {
+    fn drop(&mut self) {
+        // Ensure all chunks are freed before dropping
+        let inner = self.inner.lock();
+        unsafe {
+            core::ptr::write_bytes(inner.pool, 0, N);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,7 +374,8 @@ mod tests {
     #[test]
     fn test_basic_allocation() {
         type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
+        let mut mem = [0u8; 1024];
+        let allocator = unsafe { Alloc::new(mem.as_mut_ptr()) };
         
         let layout = Layout::from_size_align(16, 8).unwrap();
         let ptr = allocator.try_allocate(layout).unwrap();
@@ -335,7 +384,7 @@ mod tests {
         assert_eq!(ptr as usize % 8, 0);
         
         // Deallocate
-        assert!(allocator.try_deallocate(ptr, layout).is_ok());
+        assert!(allocator.try_deallocate(ptr).is_ok());
         
         #[cfg(feature = "statistics")]
         {
@@ -347,7 +396,8 @@ mod tests {
     #[test]
     fn test_multiple_allocations() {
         type Alloc = MemoryPoolAllocator<1024, 64>;
-        let allocator = Alloc::new();
+        let mut mem = [0u8; 1024];
+        let allocator = unsafe { Alloc::new(mem.as_mut_ptr()) };
         
         let layout = Layout::from_size_align(16, 8).unwrap();
         let mut ptrs = [core::ptr::null_mut(); 10];
@@ -376,7 +426,7 @@ mod tests {
         
         // Deallocate all
         for i in 0..count {
-            assert!(allocator.try_deallocate(ptrs[i], layout).is_ok());
+            assert!(allocator.try_deallocate(ptrs[i]).is_ok());
         }
 
         #[cfg(feature = "statistics")]
@@ -388,64 +438,56 @@ mod tests {
 
     #[test]
     fn test_alignment_handling() {
-        type Alloc = MemoryPoolAllocator<2048, 128>;
-        let allocator = Alloc::new();
+        type Alloc = MemoryPoolAllocator<2048, 32>;
+        #[repr(align(32))]
+        struct Aligned {
+            mem: [u8;1024]
+        }
+        let mut aligned = Aligned { mem: [0; 1024] };
+        let allocator = unsafe { Alloc::new(aligned.mem.as_mut_ptr()) };
         
         // Allocate with different alignments
         let layout1 = Layout::from_size_align(32, 16).unwrap();
         let ptr1 = allocator.try_allocate(layout1).unwrap();
         assert_eq!(ptr1 as usize % 16, 0);
         
-        // let layout2 = Layout::from_size_align(64, 32).unwrap();
-        // let ptr2 = allocator.try_allocate(layout2).unwrap();
-        // assert_eq!(ptr2 as usize % 32, 0);
+        let layout2 = Layout::from_size_align(64, 32).unwrap();
+        let ptr2 = allocator.try_allocate(layout2).unwrap();
+        assert_eq!(ptr2 as usize % 32, 0);
         
         // Deallocate
-        assert!(allocator.try_deallocate(ptr1, layout1).is_ok());
-        // assert!(allocator.try_deallocate(ptr2, layout2).is_ok());
+        allocator.try_deallocate(ptr1).unwrap();
+        allocator.try_deallocate(ptr2).unwrap();
     }
 
     #[test]
     #[cfg(feature = "statistics")]
     fn test_error_handling() {
        
-    }
-
-    #[test]
-    #[cfg(feature = "statistics")]
-    fn test_fragmentation_stats() {
-        type Alloc = MemoryPoolAllocator<256, 16>;
-        let allocator = Alloc::new();
+        type Alloc = MemoryPoolAllocator<512, 32>;
+        let mut mem = [0u8; 1024];
+        let allocator = unsafe { Alloc::new(mem.as_mut_ptr()) };
         
         let layout = Layout::from_size_align(16, 8).unwrap();
-        let mut ptrs = [core::ptr::null_mut(); 8];
         
-        // Allocate every other chunk
-        for i in 0..8 {
-            if let Ok(ptr) = allocator.try_allocate(layout) {
-                ptrs[i] = ptr;
-            }
+        // Try allocating more than available
+        for _ in 0..32 {
+            assert!(allocator.try_allocate(layout).is_ok());
         }
         
-        // Free every other allocation to create fragmentation
-        for i in 0..8 {
-            if i % 2 == 1 && !ptrs[i].is_null() {
-                allocator.try_deallocate(ptrs[i], layout).unwrap();
-            }
-        }        
+        // Next allocation should fail
+        assert!(allocator.try_allocate(layout).is_err());
         
-        // Clean up remaining allocations
-        for i in 0..8 {
-            if i % 2 == 0 && !ptrs[i].is_null() {
-                allocator.try_deallocate(ptrs[i], layout).unwrap();
-            }
-        }
+        // Check stats
+        let stats = allocator.stats.lock();
+        assert!(stats.allocation_errors > 0);
     }
 
     #[test]
     fn test_full_pool() {
         type Alloc = MemoryPoolAllocator<64, 4>;
-        let allocator = Alloc::new();
+        let mut mem = [0u8; 1024];
+        let allocator = unsafe { Alloc::new(mem.as_mut_ptr()) };
         
         let layout = Layout::from_size_align(16, 8).unwrap();
         
@@ -459,21 +501,22 @@ mod tests {
         assert!(allocator.try_allocate(layout).is_err());
         
         // Free one and try again
-        allocator.try_deallocate(ptr2, layout).unwrap();
+        allocator.try_deallocate(ptr2).unwrap();
         let ptr5 = allocator.try_allocate(layout).unwrap();
         
         // Clean up
-        allocator.try_deallocate(ptr1, layout).unwrap();
-        allocator.try_deallocate(ptr3, layout).unwrap();
-        allocator.try_deallocate(ptr4, layout).unwrap();
-        allocator.try_deallocate(ptr5, layout).unwrap();
+        allocator.try_deallocate(ptr1).unwrap();
+        allocator.try_deallocate(ptr3).unwrap();
+        allocator.try_deallocate(ptr4).unwrap();
+        allocator.try_deallocate(ptr5).unwrap();
     }
 
     #[test]
     #[cfg(feature = "zero-on-free")]
     fn test_memory_zeroing() {
         type Alloc = MemoryPoolAllocator<64, 4>;
-        let allocator = Alloc::new();
+        let mut mem = [0u8; 1024];
+        let allocator = unsafe { Alloc::new(mem.as_mut_ptr()) };
         
         let layout = Layout::from_size_align(16, 8).unwrap();
         let ptr = allocator.try_allocate(layout).unwrap();
@@ -485,7 +528,7 @@ mod tests {
         }
         
         // Deallocate
-        allocator.try_deallocate(ptr, layout).unwrap();
+        allocator.try_deallocate(ptr).unwrap();
         
         // Reallocate
         let ptr2 = allocator.try_allocate(layout).unwrap();
@@ -498,6 +541,6 @@ mod tests {
         }
         assert!(buffer.iter().all(|&b| b == 0));
         
-        allocator.try_deallocate(ptr2, layout).unwrap();
+        allocator.try_deallocate(ptr2).unwrap();
     }
 }
