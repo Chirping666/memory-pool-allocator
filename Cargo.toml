@@ -7,6 +7,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["no-alloc", "allocator", "memory pool"]
 categories = ["embedded", "memory-management", "no-std::no-alloc"]
+description = "A fixed-size, thread-safe memory pool allocator for Rust, supporting custom chunk sizes and efficient allocation/deallocation."
 
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
