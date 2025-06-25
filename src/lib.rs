@@ -72,14 +72,17 @@ struct PoolInner<const N: usize, const M: usize> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetaInfo {
-    /// Chunk is free
-    Free,
-    /// Free range of chunks
-    FreeStart(usize),
+    /// Start of a number of free chunks
+    Free(usize),
+    
+    FreeContinuation,
+    
+    AllocStart {
+        size: usize, // Size of the allocation
+        ptr_offset: usize, // Offset from the chunk base
+    },
     /// Chunk is allocated
-    Allocated,
-    /// Pointer is allocated with size
-    Ptr(usize),
+    AllocContinuation,
 }
 
 /// Allocation errors
@@ -154,10 +157,12 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
     /// # Safety
     /// The caller must ensure the pointer is valid for reads/writes of N bytes and properly aligned for all pool operations.
     pub const unsafe fn new(pool: *mut u8) -> Self {
+        let mut meta = [MetaInfo::Free; M];
+        meta[0] = MetaInfo::FreeStart(M); // Initialize first chunk as FreeStart
         Self {
             inner: Mutex::new(PoolInner {
                 pool,
-                meta: [MetaInfo::Free; M],
+                meta,
             }),
             #[cfg(feature = "statistics")]
             stats: Mutex::new(PoolStats::new()),
@@ -294,130 +299,23 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
 
     /// Checks if a specific chunk is allocated
     #[inline]
-    fn is_chunk_allocated(&self, meta: &[MetaInfo; M], chunk_idx: usize) -> bool {
-        matches!(meta[chunk_idx], MetaInfo::Allocated | MetaInfo::Ptr(_))
-    }
-
-    /// Checks if a specific chunk is the start of an allocation
-    #[inline]
-    fn is_ptr_allocated(&self, meta: &[MetaInfo; M], chunk_idx: usize) -> bool {
-        matches!(meta[chunk_idx], MetaInfo::Ptr(_))
+    fn is_allocated(&self, meta: &[MetaInfo; M], chunk_idx: usize) -> bool {
+        todo!()
     }
 
     /// Marks a range of chunks as allocated (Ptr/Allocated)
     fn mark_allocated(&self, meta: &mut [MetaInfo; M], start_chunk: usize, chunk_size: usize) -> Result<()> {
-        if start_chunk + chunk_size > M {
-            return Err(anyhow!(AllocError::OutOfMemory).context("Not enough space to allocate chunks"));
-        }
-        meta[start_chunk] = MetaInfo::Ptr(chunk_size);
-        for i in 1..chunk_size {
-            meta[start_chunk + i] = MetaInfo::Allocated;
-        }
-        // If there is leftover free space after the allocation, update FreeStart
-        let after = start_chunk + chunk_size;
-        if after < M {
-            // Find the size of the remaining free run
-            let mut right_free = 0;
-            let mut idx = after;
-            while idx < M && matches!(meta[idx], MetaInfo::Free) {
-                right_free += 1;
-                idx += 1;
-            }
-            if right_free > 0 {
-                meta[after] = MetaInfo::FreeStart(right_free);
-                for j in after+1..after+right_free {
-                    if j < M {
-                        meta[j] = MetaInfo::Free;
-                    }
-                }
-            }
-        }
-        Ok(())
+        todo!()
     }
 
     /// Marks a range of chunks as free and coalesces with adjacent free regions
     fn mark_chunks_free(&self, meta: &mut [MetaInfo; M], start_chunk: usize) -> Result<()> {
-        use MetaInfo::*;
-        // Only allow deallocation at a Ptr
-        let size = match meta[start_chunk] {
-            Ptr(sz) => sz,
-            _ => return Err(anyhow!(AllocError::NotAllocated).context("Chunk not allocated with Ptr")),
-        };
-        if start_chunk + size > M {
-            return Err(anyhow!(AllocError::OutOfMemory).context("Invalid chunk range to free"));
-        }
-        // Mark all as Free, except the new FreeStart
-        for i in start_chunk..start_chunk+size {
-            meta[i] = Free;
-        }
-        // Coalesce with right
-        let mut total_size = size;
-        let right = start_chunk + size;
-        if right < M {
-            if let FreeStart(right_size) = meta[right] {
-                total_size += right_size;
-                // Clear the old FreeStart
-                meta[right] = Free;
-            }
-        }
-        // Coalesce with left
-        let mut left = start_chunk;
-        while left > 0 && matches!(meta[left-1], Free) {
-            left -= 1;
-        }
-        if left > 0 {
-            if let FreeStart(left_size) = meta[left-1] {
-                total_size += left_size;
-                meta[left-1] = Free;
-                left -= left_size;
-            }
-        }
-        // Set the new FreeStart
-        meta[left] = FreeStart(total_size);
-        for i in left+1..left+total_size {
-            if i < M {
-                meta[i] = Free;
-            }
-        }
-        Ok(())
+        todo!()
     }
 
     /// Finds a contiguous free region that can accommodate the request, considering alignment
     fn find_free_region(&self, inner: &PoolInner<N, M>, chunks_needed: usize, align: usize) -> Option<(usize,usize)> {
-        let pool_base = inner.pool as usize;
-        let mut i = 0;
-        while i < M {
-            if let MetaInfo::FreeStart(free_size) = inner.meta[i] {
-                let start_of_run = i;
-                let end_of_run = i + free_size;
-                let mut j = start_of_run;
-                while j + chunks_needed <= end_of_run {
-                    let block_addr = pool_base + j * Self::CHUNK_SIZE;
-                    let aligned_addr = (block_addr + align - 1) & !(align - 1);
-                    let alignment_waste = aligned_addr - block_addr;
-                    let alignment_chunks = (alignment_waste + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE;
-                    let alloc_start = j + alignment_chunks;
-                    if alloc_start + chunks_needed <= end_of_run {
-                        // Check if all chunks in the range are free
-                        let mut all_free = true;
-                        for k in alloc_start..alloc_start+chunks_needed {
-                            if !matches!(inner.meta[k], MetaInfo::Free | MetaInfo::FreeStart(_)) {
-                                all_free = false;
-                                break;
-                            }
-                        }
-                        if all_free {
-                            return Some((alloc_start, chunks_needed));
-                        }
-                    }
-                    j += 1;
-                }
-                i = end_of_run;
-            } else {
-                i += 1;
-            }
-        }
-        None
+        todo!()
     }
 
 }
