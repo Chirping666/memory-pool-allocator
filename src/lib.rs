@@ -157,8 +157,8 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
     /// # Safety
     /// The caller must ensure the pointer is valid for reads/writes of N bytes and properly aligned for all pool operations.
     pub const unsafe fn new(pool: *mut u8) -> Self {
-        let mut meta = [MetaInfo::Free; M];
-        meta[0] = MetaInfo::FreeStart(M); // Initialize first chunk as FreeStart
+        let mut meta = [MetaInfo::FreeContinuation; M];
+        meta[0] = MetaInfo::Free(M); // Initialize first chunk as FreeStart
         Self {
             inner: Mutex::new(PoolInner {
                 pool,
