@@ -8,11 +8,14 @@
 //! - Optional statistics and zero-on-free features
 //! - Thread-safe via `parking_lot::Mutex`
 //!
-//! ### Default Features
+//! ## Default Features
 //! - **zero-on-free**: Zeroes memory of each allocation when it is deallocated.
 //! - **zero-on-drop**: Zeroes the entire memory pool when the allocator is dropped.
 //! - **statistics**: Tracks allocation and deallocation statistics (number of allocated chunks, allocation/deallocation errors).
 //!
+//! ## Optional Feature
+//! - **debug**: Adds assertions of pool consistency for debug builds.
+//! 
 //! ## Type Parameters
 //! - `N`: Total pool size in bytes
 //! - `M`: Number of chunks to divide the pool into
@@ -220,6 +223,7 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
                 pool_base,
             )?;
 
+            #[cfg(feature = "debug")]
             #[cfg(debug_assertions)]
             {
                 debug_assert!(
@@ -307,6 +311,7 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
             allocation_info.total_chunks,
         )?;
 
+        #[cfg(feature = "debug")]
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -503,6 +508,7 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
             }
         }
 
+        #[cfg(feature = "debug")]
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -534,6 +540,7 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         // This is simpler and safer than trying to do complex coalescing
         self.rebuild_free_markers(meta);
 
+        #[cfg(feature = "debug")]
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -600,6 +607,7 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
     // }
 
     /// Validate pool consistency (debug builds only)
+    #[cfg(feature = "debug")]
     #[cfg(debug_assertions)]
     fn validate_pool_consistency(&self, meta: &[MetaInfo; M]) -> bool {
         let mut i = 0;

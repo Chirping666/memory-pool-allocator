@@ -56,6 +56,9 @@ allocator.try_deallocate(ptr).unwrap();
 - **zero-on-drop**: Zeroes the entire memory pool when the allocator is dropped.
 - **statistics**: Tracks allocation and deallocation statistics (number of allocated chunks, allocation/deallocation errors).
 
+## Optional Feature
+- **debug**: Adds assertions of pool consistency for debug builds.
+
 ## License
 Licensed under either of
  - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
