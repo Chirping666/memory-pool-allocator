@@ -15,7 +15,7 @@
 //!
 //! ## Optional Feature
 //! - **debug**: Adds assertions of pool consistency for debug builds.
-//! 
+//!
 //! ## Type Parameters
 //! - `N`: Total pool size in bytes
 //! - `M`: Number of chunks to divide the pool into
@@ -421,29 +421,18 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
 
                         // Check if we have enough space in this free region
                         if try_start + total_chunks <= free_end {
-                            // Verify all chunks in the range are actually free
-                            let all_free =
-                                (try_start..(try_start + total_chunks)).all(|check_idx| {
-                                    matches!(
-                                        inner.meta[check_idx],
-                                        MetaInfo::Free(_) | MetaInfo::FreeContinuation
-                                    )
-                                });
+                            // Recalculate the actual aligned pointer within our reserved space
+                            let reserved_start_addr = pool_base + try_start * Self::CHUNK_SIZE;
+                            let final_aligned_addr =
+                                (reserved_start_addr + align - 1) & !(align - 1);
 
-                            if all_free {
-                                // Recalculate the actual aligned pointer within our reserved space
-                                let reserved_start_addr = pool_base + try_start * Self::CHUNK_SIZE;
-                                let final_aligned_addr =
-                                    (reserved_start_addr + align - 1) & !(align - 1);
-
-                                // Ensure the aligned address is within our reserved region
-                                let reserved_end_addr =
-                                    pool_base + (try_start + total_chunks) * Self::CHUNK_SIZE;
-                                if final_aligned_addr + (chunks_needed * Self::CHUNK_SIZE)
-                                    <= reserved_end_addr
-                                {
-                                    return Some((try_start, total_chunks, final_aligned_addr));
-                                }
+                            // Ensure the aligned address is within our reserved region
+                            let reserved_end_addr =
+                                pool_base + (try_start + total_chunks) * Self::CHUNK_SIZE;
+                            if final_aligned_addr + (chunks_needed * Self::CHUNK_SIZE)
+                                <= reserved_end_addr
+                            {
+                                return Some((try_start, total_chunks, final_aligned_addr));
                             }
                         }
                     }
@@ -478,6 +467,45 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         let chunk_base_addr = pool_base + start_chunk * Self::CHUNK_SIZE;
         let ptr_offset = user_ptr - chunk_base_addr;
 
+        // Determine the full free region that contains this allocation
+        let mut region_start = start_chunk;
+        while region_start > 0 && matches!(meta[region_start - 1], MetaInfo::FreeContinuation) {
+            region_start -= 1;
+        }
+
+        let free_region_size = match meta.get(region_start) {
+            Some(MetaInfo::Free(size)) => *size,
+            Some(
+                MetaInfo::FreeContinuation
+                | MetaInfo::AllocStart { .. }
+                | MetaInfo::AllocContinuation,
+            ) => {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Attempted to allocate from a non-free region"));
+            }
+            None => {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Allocation region start out of bounds"));
+            }
+        };
+
+        let region_end = region_start + free_region_size;
+        if start_chunk + total_chunks > region_end {
+            return Err(anyhow!(AllocError::OutOfMemory)
+                .context("Allocation exceeds available free region"));
+        }
+
+        // Temporarily mark the entire region as continuations so we can rebuild
+        for idx in region_start..region_end {
+            meta[idx] = MetaInfo::FreeContinuation;
+        }
+
+        // Restore any leading free region before the allocation
+        let leading_free = start_chunk.saturating_sub(region_start);
+        if leading_free > 0 {
+            Self::set_free_region(meta, region_start, leading_free);
+        }
+
         // Mark the first chunk with the allocation info
         meta[start_chunk] = MetaInfo::AllocStart {
             size: total_chunks,
@@ -489,23 +517,10 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
             meta[start_chunk + i] = MetaInfo::AllocContinuation;
         }
 
-        // Handle any remaining free space after our allocation
-        let after_allocation = start_chunk + total_chunks;
-        if after_allocation < M {
-            // Check if there are contiguous free chunks after our allocation
-            let mut remaining_free = 0;
-            let mut scan_idx = after_allocation;
-
-            while scan_idx < M && matches!(meta[scan_idx], MetaInfo::FreeContinuation) {
-                remaining_free += 1;
-                scan_idx += 1;
-            }
-
-            // If there are free chunks, mark them properly
-            if remaining_free > 0 {
-                meta[after_allocation] = MetaInfo::Free(remaining_free);
-                // The rest remain as FreeContinuation (they're already FreeContinuation)
-            }
+        // Restore any trailing free region after the allocation
+        let allocation_end = start_chunk + total_chunks;
+        if allocation_end < region_end {
+            Self::set_free_region(meta, allocation_end, region_end - allocation_end);
         }
 
         #[cfg(feature = "debug")]
@@ -531,14 +546,34 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
             return Err(anyhow!(AllocError::OutOfMemory).context("Invalid chunk range"));
         }
 
-        // First, mark all chunks in the allocation as free continuations
-        for i in start_chunk..(start_chunk + chunk_count) {
-            meta[i] = MetaInfo::FreeContinuation;
+        let left_region = if start_chunk > 0 {
+            Self::free_region_info(meta, start_chunk - 1)
+        } else {
+            None
+        };
+
+        let right_index = start_chunk + chunk_count;
+        let right_region = if right_index < M {
+            Self::free_region_info(meta, right_index)
+        } else {
+            None
+        };
+
+        let mut region_start = start_chunk;
+        if let Some((left_start, _)) = left_region {
+            region_start = left_start;
         }
 
-        // Now rebuild all free region markers by scanning the entire metadata array
-        // This is simpler and safer than trying to do complex coalescing
-        self.rebuild_free_markers(meta);
+        let mut region_end = start_chunk + chunk_count;
+        if let Some((right_start, right_size)) = right_region {
+            region_end = core::cmp::max(region_end, right_start + right_size);
+        }
+
+        for idx in region_start..region_end {
+            meta[idx] = MetaInfo::FreeContinuation;
+        }
+
+        Self::set_free_region(meta, region_start, region_end - region_start);
 
         #[cfg(feature = "debug")]
         #[cfg(debug_assertions)]
@@ -552,44 +587,37 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
         Ok(())
     }
 
-    /// Rebuild free region markers after freeing chunks
-    /// This scans the entire metadata array and properly marks free regions
-    fn rebuild_free_markers(&self, meta: &mut [MetaInfo; M]) {
-        let mut i = 0;
-        while i < M {
-            match meta[i] {
-                MetaInfo::FreeContinuation | MetaInfo::Free(_) => {
-                    // Found the start of a free region (or need to rebuild it), count its size
-                    let start = i;
-                    let mut size = 0;
+    fn free_region_info(meta: &[MetaInfo; M], idx: usize) -> Option<(usize, usize)> {
+        if idx >= M {
+            return None;
+        }
 
-                    // Count consecutive free chunks (both FreeContinuation and Free(_))
-                    while i < M && matches!(meta[i], MetaInfo::FreeContinuation | MetaInfo::Free(_))
-                    {
-                        size += 1;
-                        i += 1;
-                    }
+        match meta[idx] {
+            MetaInfo::Free(size) => Some((idx, size)),
+            MetaInfo::FreeContinuation => {
+                let mut start = idx;
+                while start > 0 && matches!(meta[start - 1], MetaInfo::FreeContinuation) {
+                    start -= 1;
+                }
 
-                    // Mark this free region properly
-                    if size > 0 {
-                        meta[start] = MetaInfo::Free(size);
-                        // Mark the rest as FreeContinuation
-                        for j in (start + 1)..(start + size) {
-                            if j < M {
-                                meta[j] = MetaInfo::FreeContinuation;
-                            }
-                        }
-                    }
-                }
-                MetaInfo::AllocStart { size, .. } => {
-                    // Skip this entire allocation
-                    i += size;
-                }
-                MetaInfo::AllocContinuation => {
-                    // This shouldn't happen at a scan position, but handle it gracefully
-                    i += 1;
+                if let MetaInfo::Free(size) = meta[start] {
+                    Some((start, size))
+                } else {
+                    None
                 }
             }
+            _ => None,
+        }
+    }
+
+    fn set_free_region(meta: &mut [MetaInfo; M], start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+
+        meta[start] = MetaInfo::Free(len);
+        for offset in 1..len {
+            meta[start + offset] = MetaInfo::FreeContinuation;
         }
     }
 
