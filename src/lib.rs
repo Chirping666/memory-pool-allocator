@@ -469,24 +469,27 @@ impl<const N: usize, const M: usize> MemoryPoolAllocator<N, M> {
 
         // Determine the full free region that contains this allocation
         let mut region_start = start_chunk;
-        let free_region_size = loop {
-            match meta.get(region_start) {
-                Some(MetaInfo::Free(size)) => break *size,
-                Some(MetaInfo::FreeContinuation) => {
-                    if region_start == 0 {
-                        return Err(anyhow!(AllocError::OutOfMemory)
-                            .context("Free continuation without region header"));
-                    }
-                    region_start -= 1;
-                }
-                Some(MetaInfo::AllocStart { .. } | MetaInfo::AllocContinuation) => {
-                    return Err(anyhow!(AllocError::OutOfMemory)
-                        .context("Attempted to allocate from a non-free region"));
-                }
-                None => {
-                    return Err(anyhow!(AllocError::OutOfMemory)
-                        .context("Allocation region start out of bounds"));
-                }
+        while matches!(meta.get(region_start), Some(MetaInfo::FreeContinuation)) {
+            if region_start == 0 {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Free continuation without region header"));
+            }
+            region_start -= 1;
+        }
+
+        let free_region_size = match meta.get(region_start) {
+            Some(MetaInfo::Free(size)) => *size,
+            Some(MetaInfo::AllocStart { .. } | MetaInfo::AllocContinuation) => {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Attempted to allocate from a non-free region"));
+            }
+            Some(MetaInfo::FreeContinuation) => {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Free region header missing before continuation"));
+            }
+            None => {
+                return Err(anyhow!(AllocError::OutOfMemory)
+                    .context("Allocation region start out of bounds"));
             }
         };
 
