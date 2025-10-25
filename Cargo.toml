@@ -1,6 +1,6 @@
 [package]
 name = "memory-pool-allocator"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 repository = "https://github.com/Chirping666/memory-pool-allocator"
 readme = "README.md"
